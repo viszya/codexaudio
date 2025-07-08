@@ -9,7 +9,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 3  # Adjust based on your aggregate device
 RATE = 44100
 CHUNK = 1024
-base_dir = "/Users/viszya/audio_recordings"  # Specify your base directory here (e.g., "/path/to/recordings")
+base_dir = "/Users/vedant/audio_recordings"  # Specify your base directory here (e.g., "/path/to/recordings")
 
 # Initialize PyAudio
 p = pyaudio.PyAudio()
