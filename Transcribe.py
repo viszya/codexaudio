@@ -1,135 +1,80 @@
-import whisper
+import argparse
+import math
 import os
-from tqdm import tqdm
-import json
-from datetime import datetime
 import time
+import warnings
+import torch
+import whisper
+from tqdm import tqdm
 
-# Function to get MP3 duration using mutagen if available
-mutagen_available = None  # None = not checked yet, True/False = checked
+# Process the audio in fixed‑length chunks so we can give the progress bar a
+# meaningful total. 30 seconds strikes a good balance between speed and context.
+SEGMENT_SEC = 30
 
-def get_mp3_duration(path):
-    global mutagen_available
-    if mutagen_available is False:
-        return 0
-    try:
-        from mutagen.mp3 import MP3
-        mutagen_available = True
-        audio = MP3(path)
-        return audio.info.length
-    except ImportError:
-        mutagen_available = False
-        return 0
-    except Exception:
-        return 0
+def transcribe_file(mp3_path: str, model_name: str) -> None:
+    """Transcribe a single .mp3 file with Whisper and save <basename>_transcript.txt."""
+    if not mp3_path.lower().endswith(".mp3"):
+        raise ValueError("Please provide an .mp3 file")
 
-RECORDINGS_DIR = "./recordings"
-STATS_FILE = os.path.join(RECORDINGS_DIR, ".transcribe_stats.json")
+    out_path = f"{os.path.splitext(mp3_path)[0]}_transcript.txt"
+    if os.path.exists(out_path):
+        print(f"✓ Transcript already exists → {out_path}")
+        return
 
-# Load Whisper model (medium.en for English, ~1.5 GB)
-model = whisper.load_model("medium.en")
+    # Select Metal (MPS) if available, otherwise CPU.
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-# Find all .mp3 files in the recordings directory
-mp3_files = [f for f in os.listdir(RECORDINGS_DIR) if f.endswith('.mp3')]
+    # Suppress “FP16 not supported on CPU” warning noise.
+    warnings.filterwarnings("ignore", category=UserWarning)
 
-# Filter to only those without a corresponding _transcript.json
-files_to_process = []
-for mp3_file in mp3_files:
-    base_name = os.path.splitext(mp3_file)[0]
-    transcript_path = os.path.join(RECORDINGS_DIR, f"{base_name}_transcript.json")
-    if not os.path.exists(transcript_path):
-        files_to_process.append(mp3_file)
-    else:
-        print(f"Skipping {mp3_file}: transcript already exists.")
+    model = whisper.load_model(model_name).to(device)
 
-# Load stats if available
-stats = []
-if os.path.exists(STATS_FILE):
-    try:
-        with open(STATS_FILE, 'r') as f:
-            stats = json.load(f)
-    except Exception:
-        stats = []
+    # Load the audio once so we know its duration and can figure out how many
+    # chunks we’ll have to process.
+    audio = whisper.load_audio(mp3_path)
+    sample_rate = whisper.audio.SAMPLE_RATE
+    total_sec = len(audio) / sample_rate
+    total_segments = math.ceil(total_sec / SEGMENT_SEC)
 
-if not files_to_process:
-    print("No new MP3 files to process.")
-else:
-    if mutagen_available is False:
-        print("[INFO] 'mutagen' not installed. MP3 durations will be shown as 'unknown'. To enable duration display, run: pip install mutagen")
-    total_files = len(files_to_process)
-    times = []
-    for idx, mp3_file in enumerate(files_to_process, 1):
-        mp3_path = os.path.join(RECORDINGS_DIR, mp3_file)
-        base_name = os.path.splitext(mp3_file)[0]
-        # Get duration
-        duration = 0
-        try:
-            duration = get_mp3_duration(mp3_path)
-        except Exception:
-            pass
-        if duration:
-            print(f"Processing {mp3_file} (duration: {duration/60:.2f} min)...")
-        else:
-            print(f"Processing {mp3_file} (duration: unknown)...")
-        # Estimate time before starting
-        file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-        avg_sec_per_mb = None
-        valid_stats = [s for s in stats if s.get('size_mb', 0) > 0.5 and s.get('time_sec', 0) > 5]
-        if valid_stats:
-            avg_sec_per_mb = sum(s['time_sec']/s['size_mb'] for s in valid_stats) / len(valid_stats)
-        if avg_sec_per_mb is not None:
-            est_time = avg_sec_per_mb * file_size_mb
-            print(f"Estimated time for this file: {est_time/60:.2f} min (based on previous runs)")
-        else:
-            print(f"Estimated time remaining: unknown (processing first file)")
-        # Live spinner/progress message with elapsed time
-        start = time.time()
-        with tqdm(total=0, desc=f"Transcribing {mp3_file} | Elapsed: 0.0s", bar_format="{l_bar}{bar}| {desc}", leave=False) as spinner:
-            # Update spinner every second while transcribing
-            import threading
-            stop_spinner = False
-            def update_spinner():
-                while not stop_spinner:
-                    elapsed = time.time() - start
-                    spinner.set_description_str(f"Transcribing {mp3_file} | Elapsed: {elapsed:.1f}s")
-                    spinner.refresh()
-                    time.sleep(1)
-            t = threading.Thread(target=update_spinner)
-            t.start()
-            result = model.transcribe(mp3_path, word_timestamps=True)
-            stop_spinner = True
-            t.join()
-        elapsed = time.time() - start
-        times.append(elapsed)
-        # Save minimal text+words result (per file)
-        minimal = {"text": result.get("text", "")}
-        words = []
-        if "segments" in result:
-            for seg in result["segments"]:
-                if isinstance(seg, dict):
-                    for w in seg.get("words", []):
-                        word = w.get("word")
-                        if word is not None:
-                            words.append(word)
-        if words:
-            minimal["words"] = words
-        transcript_path = os.path.join(RECORDINGS_DIR, f"{base_name}_transcript.json")
-        with open(transcript_path, 'w') as f:
-            json.dump(minimal, f, indent=2)
-        print(f"Saved transcript: {transcript_path}")
-        print(f"Time taken: {elapsed:.2f} seconds.")
-        # Save/update stats
-        if file_size_mb > 0.5 and elapsed > 5:
-            stats.append({'size_mb': file_size_mb, 'time_sec': elapsed})
-            try:
-                with open(STATS_FILE, 'w') as f:
-                    json.dump(stats, f)
-            except Exception:
-                pass
-        # Estimate time remaining for batch
-        avg_time = sum(times) / len(times)
-        files_left = total_files - idx
-        if files_left > 0:
-            eta = avg_time * files_left
-            print(f"Estimated time remaining: {eta/60:.2f} min for {files_left} file(s).")
-    print("All files processed.")
+    start = time.time()
+    transcripts: list[str] = []
+
+    # Nicely‑formatted tqdm bar that mirrors the style you asked for:
+    # Transcribing <file>.txt: 100%|████…| 2/2 [00:00<00:00, 6.47tokens/s]
+    with tqdm(
+        total=total_segments,
+        desc=f"Transcribing {os.path.basename(mp3_path)}",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        unit="tokens",  # so the speed shows “tokens/s” like in your example
+    ) as pbar:
+        for i in range(total_segments):
+            seg_start = int(i * SEGMENT_SEC * sample_rate)
+            seg_end = int(min((i + 1) * SEGMENT_SEC * sample_rate, len(audio)))
+            seg_audio = audio[seg_start:seg_end]
+
+            # Whisper accepts a NumPy array directly, so no need to write temp files.
+            seg_text = model.transcribe(seg_audio, fp16=False, verbose=False)["text"].strip()
+            transcripts.append(seg_text)
+
+            pbar.update(1)
+
+    text = "\n".join(transcripts)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    print(f"Saved → {out_path}  ({time.time() - start:.1f}s)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Whisper MP3‑to‑TXT (Apple MPS)")
+    parser.add_argument("file", help="Path to .mp3 file")
+    parser.add_argument("--model", default="medium.en", help="Whisper model name (default: medium.en)")
+    args = parser.parse_args()
+
+    transcribe_file(args.file, args.model)
+
+
+if __name__ == "__main__":
+    main()
