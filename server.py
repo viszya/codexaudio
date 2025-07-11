@@ -1,130 +1,152 @@
 import os
-import argparse
-from pathlib import Path
-import subprocess
-import http.server
-import socketserver
-import threading
-import shutil
 import time
+import threading
+import logging
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from pathlib import Path
+from pydantic import BaseModel
+import shutil
+from dotenv import load_dotenv
+import sys
+from transcribe import transcribe_file
+from summarize import summarize
 
-# Default configurations
+# Configure logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
+)
+
+# Load environment variables
+load_dotenv()
+
+# Constants
 DEFAULT_MODEL = "google/gemma-3-4b-it"
-DEFAULT_PROMPT = Path("prompt.txt").read_text(encoding="utf-8")
-DEFAULT_MAX_TOKENS = 1000
-DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TRANSCRIPT_SUFFIX = "_transcript.txt"
 DEFAULT_SUMMARY_SUFFIX = "_summary.md"
 DEFAULT_TRANSCRIBE_MODEL = "medium.en"
+PROCESSING_DIRECTORY = "/app/audio"
+MONITOR_INTERVAL = 10  # Seconds between directory checks
 
-# Path to the scripts
-scripts_dir = '/Users/viszya/Developer/Programs/Python/codexaudio'
+# FastAPI App initialization
+app = FastAPI()
 
-# Ensure that we're always in the correct directory for the scripts
-os.chdir(scripts_dir)
+# File processing request model
+class FileProcessingRequest(BaseModel):
+    file_path: str
 
-# Function to transcribe an MP3 file using Whisper (transcribe.py functionality)
-def transcribe(file: str, model: str = DEFAULT_TRANSCRIBE_MODEL):
-    print(f"Running transcription for {file}...")
-    command = [
-        "python3", "transcribe.py", file, "--model", model
-    ]
-    subprocess.run(command, cwd=scripts_dir)  # Ensure the subprocess runs in the correct directory
-
-# Function to summarize a transcript (summarize.py functionality)
-def summarize(txt_file: str, model: str = DEFAULT_MODEL, prompt: str = DEFAULT_PROMPT, 
-             max_tokens: int = DEFAULT_MAX_TOKENS, temperature: float = DEFAULT_TEMPERATURE):
-    print(f"Running summarization for {txt_file}...")
-    command = [
-        "python3", "summarize.py", txt_file, "--model", model, "--prompt", prompt,
-        "--max_tokens", str(max_tokens), "--temperature", str(temperature)
-    ]
-    subprocess.run(command, cwd=scripts_dir)  # Ensure the subprocess runs in the correct directory
-
-# Function to process a single file
-def process_file(file_path: str):
-    if file_path.endswith(".mp3"):
-        transcript_path = file_path.replace(".mp3", DEFAULT_TRANSCRIPT_SUFFIX)
-        summary_path = file_path.replace(".mp3", DEFAULT_SUMMARY_SUFFIX)
-
-        # Check if the transcript exists
-        if not os.path.exists(transcript_path):
-            print(f"Transcribing {file_path}...")
-            transcribe(file_path)
+# Process file (transcribe and summarize)
+def process_file(file_path: str, transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL, summarize_model: str = DEFAULT_MODEL):
+    """Process an MP3 file by transcribing and summarizing it"""
+    logger.info(f"Processing file: {file_path}")
+    try:
+        transcribe_file(file_path, transcribe_model)
+        transcript_path = file_path.rsplit(".", 1)[0] + DEFAULT_TRANSCRIPT_SUFFIX
+        if os.path.exists(transcript_path):
+            summarize(transcript_path, model_id=summarize_model)
+            logger.info(f"Generated summary for: {transcript_path}")
         else:
-            print(f"Transcript exists for {file_path}, skipping transcription.")
+            logger.warning(f"Transcript not found: {transcript_path}")
+    except Exception as e:
+        logger.error(f"Error processing {file_path}: {str(e)}")
 
-        # Check if the summary exists
-        if not os.path.exists(summary_path):
-            print(f"Summarizing {transcript_path}...")
-            summarize(transcript_path)
-        else:
-            print(f"Summary exists for {file_path}, skipping summarization.")
-
-# Function to process files in the directory (including subdirectories)
-def process_files(directory: str):
-    # Walk through all files in the directory and subdirectories
+# Check and generate summaries for existing transcripts
+def check_and_summarize_transcripts(directory: str, summarize_model: str = DEFAULT_MODEL):
+    """Check for transcript files without summaries and generate them"""
     for dirpath, _, filenames in os.walk(directory):
         for file in filenames:
-            file_path = os.path.join(dirpath, file)
-            process_file(file_path)
+            if file.endswith(DEFAULT_TRANSCRIPT_SUFFIX):
+                transcript_path = os.path.join(dirpath, file)
+                summary_path = transcript_path.rsplit(".", 1)[0] + DEFAULT_SUMMARY_SUFFIX
+                if not os.path.exists(summary_path):
+                    logger.info(f"Found transcript without summary: {transcript_path}")
+                    try:
+                        summarize(transcript_path, model_id=summarize_model)
+                        logger.info(f"Generated summary: {summary_path}")
+                    except Exception as e:
+                        logger.error(f"Error summarizing {transcript_path}: {str(e)}")
 
-# Function to monitor directory for new files and process them
-def monitor_directory(directory: str, interval: int = 10):
+# API to process an MP3 file (transcribe and summarize)
+@app.post("/process/")
+async def process_file_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """API to process an MP3 file (transcribe and summarize)"""
+    if not file.filename.endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="File must be an MP3")
+    temp_file_path = f"/tmp/{file.filename}"
+    with open(temp_file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    background_tasks.add_task(process_file, temp_file_path)
+    return {"message": f"Started processing for {file.filename}"}
+
+# API to transcribe an MP3 file
+@app.post("/transcribe/")
+async def transcribe_file_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """API to transcribe an MP3 file"""
+    if not file.filename.endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="File must be an MP3")
+    temp_file_path = f"/tmp/{file.filename}"
+    with open(temp_file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    background_tasks.add_task(transcribe_file, temp_file_path, DEFAULT_TRANSCRIBE_MODEL)
+    return {"message": f"Started transcription for {file.filename}"}
+
+# API to summarize a transcript
+@app.post("/summarize/")
+async def summarize_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """API to summarize a transcript"""
+    if not file.filename.endswith(".txt"):
+        raise HTTPException(status_code=400, detail="File must be a TXT file")
+    temp_file_path = f"/tmp/{file.filename}"
+    with open(temp_file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    background_tasks.add_task(summarize, temp_file_path)
+    return {"message": f"Started summarization for {file.filename}"}
+
+# Endpoint to check the server status
+@app.get("/status/")
+async def get_status():
+    """Check server status"""
+    return {"status": "Server is running."}
+
+# Background task to monitor directory for new files and check transcripts
+def monitor_directory(directory: str, interval: int = MONITOR_INTERVAL):
+    """Monitor the directory and process new MP3 files and check transcripts"""
+    logger.info(f"Starting directory monitoring for {directory} with interval {interval}s")
     processed_files = set()
-
     while True:
-        # Check and process files
-        print(f"Checking for new files in {directory}...")
-        for dirpath, _, filenames in os.walk(directory):
-            for file in filenames:
-                file_path = os.path.join(dirpath, file)
-                if file_path not in processed_files and file.endswith(".mp3"):
-                    processed_files.add(file_path)
-                    process_file(file_path)
+        try:
+            # Process new MP3 files
+            for dirpath, _, filenames in os.walk(directory):
+                for file in filenames:
+                    file_path = os.path.join(dirpath, file)
+                    if file_path not in processed_files and file.endswith(".mp3"):
+                        logger.info(f"Found new MP3 file: {file_path}")
+                        processed_files.add(file_path)
+                        process_file(file_path)
+            
+            # Check for transcripts needing summaries
+            check_and_summarize_transcripts(directory)
+            
+            time.sleep(interval)
+        except Exception as e:
+            logger.error(f"Error in directory monitoring: {str(e)}")
+            time.sleep(interval)
 
-        # Wait for the next interval
-        time.sleep(interval)
-
-# Setup and start the local server
-def run_local_server(directory: str, port: int = 8000):
-    os.chdir(directory)  # Change the directory to the working directory
-    handler = http.server.SimpleHTTPRequestHandler
-    httpd = socketserver.TCPServer(("", port), handler)
-    print(f"Serving files in {directory} on port {port}")
-    httpd.serve_forever()
-
-# Function to run the whole process: transcribe or summarize based on files in the directory
-def run(directory: str):
-    print(f"Processing directory: {directory}")
-    process_files(directory)
-    print("All files processed. Starting local server...")
-    
-    # Start the local server in a separate thread
-    server_thread = threading.Thread(target=run_local_server, args=(directory,))
-    server_thread.daemon = True
-    server_thread.start()
-
-    # Monitor the directory for new files
-    monitor_thread = threading.Thread(target=monitor_directory, args=(directory,))
+# Start monitoring directory when FastAPI app starts
+@app.on_event("startup")
+async def start_monitoring():
+    """Start directory monitoring upon FastAPI startup"""
+    if not os.path.exists(PROCESSING_DIRECTORY):
+        logger.warning(f"Directory {PROCESSING_DIRECTORY} does not exist, creating it")
+        os.makedirs(PROCESSING_DIRECTORY)
+    logger.info(f"Starting monitoring thread for {PROCESSING_DIRECTORY}")
+    monitor_thread = threading.Thread(target=monitor_directory, args=(PROCESSING_DIRECTORY,))
     monitor_thread.daemon = True
     monitor_thread.start()
 
-    # Wait for the server and monitor thread to finish
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Server and monitor stopped.")
-
-# Main function to accept command-line arguments and run the process
-def main():
-    parser = argparse.ArgumentParser(description="Process MP3 files in a directory for transcription and summarization.")
-    parser.add_argument("directory", help="Directory to scan for MP3 files")
-    parser.add_argument("--port", type=int, default=8000, help="Port for local server (default: 8000)")
-    args = parser.parse_args()
-
-    run(args.directory)
-
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
